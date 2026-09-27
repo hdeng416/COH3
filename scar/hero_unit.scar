@@ -1,0 +1,285 @@
+--[[
+	英雄单位 (Hero Unit) —— 英雄连3 SCAR 脚本
+
+	功能：
+	  1. 无限升星：原版老兵满级后，继续靠击杀累计“英雄经验”，每升一星叠加伤害 / 射速 / 减伤加成。
+	  2. 武器切换：点击“切换武器”能力，在 突击武器(hardpoint_assault) 与 火箭筒(hardpoint_rocket) 之间切换。
+	  3. 脱战回血：一段时间没有受伤 / 开火后，每秒按百分比回血，星级越高回得越快。
+	  4. 阵亡保留星级（可选）：英雄阵亡后重新生产，星级继承。
+
+	单人小队、血量、武器本身的数值在属性 (Attributes) 里做，见 docs/attributes.md。
+	本脚本只按蓝图名识别英雄，所以把 HERO_CONFIG 里的名字改成你自己的即可。
+
+	注意：所有可能在不同版本里不存在的 SCAR 函数都通过 _HeroUnit_Call 调用，
+	缺失时只会在控制台打印一次 "[HeroUnit] missing SCAR function"，不会让整个脚本崩掉。
+]]
+
+HERO_CONFIG = {
+	-- 蓝图名（在 Essence Editor 里的名字）
+	squad_blueprint   = "hero_sbp",                 -- 英雄小队蓝图
+	switch_ability    = "hero_weapon_switch_abp",   -- “切换武器”能力蓝图
+	hardpoint_assault = "hardpoint_01",             -- 突击武器所在 hardpoint
+	hardpoint_rocket  = "hardpoint_02",             -- 火箭筒所在 hardpoint
+	start_weapon      = "assault",                  -- 出生时的武器："assault" 或 "rocket"
+
+	-- 升星
+	vanilla_max_rank  = 3,      -- 原版老兵满级（到这级后才开始累计英雄经验）
+	xp_first_star     = 10,     -- 第 1 颗额外星需要的经验
+	xp_star_increment = 5,      -- 之后每颗星多需要的经验（第 n 颗 = 10 + 5*(n-1)）
+	xp_per_100_hp     = 1,      -- 击杀目标每 100 点最大生命值给的经验
+	xp_max_per_kill   = 10,     -- 单次击杀经验上限（避免拆建筑刷星）
+
+	-- 每星加成（线性叠加，不是复利）
+	damage_per_star          = 0.08,  -- 伤害 +8% / 星
+	fire_rate_per_star       = 0.04,  -- 射速 +4% / 星（冷却缩短）
+	damage_reduction_per_star = 0.04, -- 受到伤害 -4% / 星
+	min_received_damage      = 0.35,  -- 受到伤害倍率下限（最多减伤 65%）
+
+	-- 脱战回血
+	regen_delay          = 8,      -- 脱战多少秒后开始回血
+	regen_pct_per_sec    = 0.03,   -- 每秒回复最大生命值的 3%
+	regen_bonus_per_star = 0.002,  -- 每星额外 +0.2%/秒
+
+	keep_stars_on_death = true,    -- 阵亡后重新生产的英雄继承星级
+	scan_interval       = 1,       -- 主循环间隔（秒）
+}
+
+HeroUnit = {
+	heroes     = {},  -- [squadID] = hero 状态
+	savedStars = {},  -- [playerID] = { stars = n, xp = x }
+	missing    = {},
+}
+
+-- 安全调用：函数不存在时跳过并只提示一次
+function _HeroUnit_Call(name, ...)
+	local fn = _G[name]
+	if type(fn) ~= "function" then
+		if not HeroUnit.missing[name] then
+			HeroUnit.missing[name] = true
+			print("[HeroUnit] missing SCAR function: " .. name .. " (feature skipped)")
+		end
+		return nil
+	end
+	return fn(...)
+end
+
+function HeroUnit_IsHero(squad)
+	return BP_GetName(Squad_GetBlueprint(squad)) == HERO_CONFIG.squad_blueprint
+end
+
+function HeroUnit_XPForStar(n)
+	return HERO_CONFIG.xp_first_star + HERO_CONFIG.xp_star_increment * (n - 1)
+end
+
+---------------------------------------------------------------------------
+-- 注册 / 清理
+---------------------------------------------------------------------------
+
+function HeroUnit_Register(squad)
+	local id = Squad_GetID(squad)
+	local player = Squad_GetPlayerOwner(squad)
+	local sg = SGroup_CreateIfNotFound("sg_hero_unit_" .. id)
+	SGroup_Clear(sg)
+	SGroup_Add(sg, squad)
+
+	local hero = {
+		squad        = squad,
+		sg           = sg,
+		playerID     = Player_GetID(player),
+		xp           = 0,
+		extraStars   = 0,
+		appliedStars = 0,
+		lastHealth   = Squad_GetHealth(squad),
+		lastCombat   = World_GetGameTime(),
+		weaponMode   = HERO_CONFIG.start_weapon,
+	}
+	HeroUnit.heroes[id] = hero
+
+	local saved = HeroUnit.savedStars[hero.playerID]
+	if HERO_CONFIG.keep_stars_on_death and saved ~= nil then
+		hero.extraStars = saved.stars
+		hero.xp = saved.xp
+	end
+
+	HeroUnit_SetWeaponMode(hero, hero.weaponMode)
+	return hero
+end
+
+function HeroUnit_Unregister(id, hero)
+	if HERO_CONFIG.keep_stars_on_death then
+		HeroUnit.savedStars[hero.playerID] = { stars = hero.extraStars, xp = hero.xp }
+	end
+	SGroup_Clear(hero.sg)
+	HeroUnit.heroes[id] = nil
+end
+
+---------------------------------------------------------------------------
+-- 无限升星
+---------------------------------------------------------------------------
+
+function HeroUnit_UpdateStars(hero)
+	while hero.xp >= HeroUnit_XPForStar(hero.extraStars + 1) do
+		hero.xp = hero.xp - HeroUnit_XPForStar(hero.extraStars + 1)
+		hero.extraStars = hero.extraStars + 1
+	end
+	while hero.appliedStars < hero.extraStars do
+		hero.appliedStars = hero.appliedStars + 1
+		HeroUnit_ApplyStar(hero, hero.appliedStars)
+	end
+end
+
+-- 第 n 星的增量倍率 = 总倍率(n) / 总倍率(n-1)，这样叠加后总加成是线性的
+function HeroUnit_ApplyStar(hero, n)
+	local c = HERO_CONFIG
+
+	local damage = (1 + c.damage_per_star * n) / (1 + c.damage_per_star * (n - 1))
+	local cooldown = (1 + c.fire_rate_per_star * (n - 1)) / (1 + c.fire_rate_per_star * n)
+	local function received(k)
+		return math.max(c.min_received_damage, 1 - c.damage_reduction_per_star * k)
+	end
+	local receivedRatio = received(n) / received(n - 1)
+
+	for _, hp in ipairs({ c.hardpoint_assault, c.hardpoint_rocket }) do
+		_HeroUnit_Call("Modify_WeaponDamage", hero.sg, hp, damage)
+		_HeroUnit_Call("Modify_WeaponCooldown", hero.sg, hp, cooldown)
+	end
+	if receivedRatio < 1 then
+		_HeroUnit_Call("Modify_ReceivedDamage", hero.sg, receivedRatio)
+	end
+
+	print("[HeroUnit] player " .. hero.playerID .. " hero reached extra star " .. n
+		.. " (total stars: " .. (c.vanilla_max_rank + n) .. ")")
+end
+
+function HeroUnit_OnEntityKilled(context)
+	local ok, err = pcall(_HeroUnit_OnEntityKilled, context)
+	if not ok then
+		print("[HeroUnit] OnEntityKilled error: " .. tostring(err))
+	end
+end
+
+function _HeroUnit_OnEntityKilled(context)
+	if context == nil or context.killer == nil or context.victim == nil then
+		return
+	end
+	if not Entity_IsPartOfSquad(context.killer) then
+		return
+	end
+	local hero = HeroUnit.heroes[Squad_GetID(Entity_GetSquad(context.killer))]
+	if hero == nil then
+		return
+	end
+	-- 原版老兵没满之前交给游戏自己的老兵系统
+	local rank = _HeroUnit_Call("Squad_GetVeterancyRank", hero.squad)
+	if rank ~= nil and rank < HERO_CONFIG.vanilla_max_rank then
+		return
+	end
+
+	local maxHealth = Entity_GetHealthMax(context.victim) or 100
+	local xp = math.max(1, maxHealth / 100) * HERO_CONFIG.xp_per_100_hp
+	hero.xp = hero.xp + math.min(xp, HERO_CONFIG.xp_max_per_kill)
+end
+
+---------------------------------------------------------------------------
+-- 武器切换
+---------------------------------------------------------------------------
+
+function HeroUnit_SetWeaponMode(hero, mode)
+	local useRocket = (mode == "rocket")
+	_HeroUnit_Call("Modify_WeaponEnabled", hero.sg, HERO_CONFIG.hardpoint_assault, not useRocket)
+	_HeroUnit_Call("Modify_WeaponEnabled", hero.sg, HERO_CONFIG.hardpoint_rocket, useRocket)
+	hero.weaponMode = mode
+end
+
+function HeroUnit_OnAbilityExecuted(context)
+	if context == nil or context.caster == nil or context.ability == nil then
+		return
+	end
+	if BP_GetName(context.ability) ~= HERO_CONFIG.switch_ability then
+		return
+	end
+	local caster = context.caster
+	if scartype(caster) == ST_ENTITY then
+		if not Entity_IsPartOfSquad(caster) then
+			return
+		end
+		caster = Entity_GetSquad(caster)
+	end
+	local hero = HeroUnit.heroes[Squad_GetID(caster)]
+	if hero == nil then
+		return
+	end
+	if hero.weaponMode == "rocket" then
+		HeroUnit_SetWeaponMode(hero, "assault")
+	else
+		HeroUnit_SetWeaponMode(hero, "rocket")
+	end
+end
+
+---------------------------------------------------------------------------
+-- 脱战回血
+---------------------------------------------------------------------------
+
+function HeroUnit_UpdateRegen(hero, now)
+	local squad = hero.squad
+	local health = Squad_GetHealth(squad)
+	local maxHealth = Squad_GetHealthMax(squad)
+	if maxHealth <= 0 then
+		return
+	end
+
+	if health < hero.lastHealth - 0.01
+		or _HeroUnit_Call("Squad_IsUnderAttack", squad, HERO_CONFIG.scan_interval)
+		or _HeroUnit_Call("Squad_IsAttacking", squad, HERO_CONFIG.scan_interval) then
+		hero.lastCombat = now
+	end
+
+	if now - hero.lastCombat >= HERO_CONFIG.regen_delay and health < maxHealth then
+		local rate = HERO_CONFIG.regen_pct_per_sec + HERO_CONFIG.regen_bonus_per_star * hero.extraStars
+		local pct = math.min(1, health / maxHealth + rate * HERO_CONFIG.scan_interval)
+		Squad_SetHealth(squad, pct)
+		health = pct * maxHealth
+	end
+	hero.lastHealth = health
+end
+
+---------------------------------------------------------------------------
+-- 主循环
+---------------------------------------------------------------------------
+
+function HeroUnit_Scan()
+	local now = World_GetGameTime()
+	local seen = {}
+
+	for i = 1, World_GetPlayerCount() do
+		local player = World_GetPlayerAt(i)
+		SGroup_ForEach(Player_GetSquads(player), function(gid, idx, squad)
+			if Squad_Count(squad) > 0 and HeroUnit_IsHero(squad) then
+				local id = Squad_GetID(squad)
+				seen[id] = true
+				local hero = HeroUnit.heroes[id] or HeroUnit_Register(squad)
+				HeroUnit_UpdateStars(hero)
+				HeroUnit_UpdateRegen(hero, now)
+			end
+		end)
+	end
+
+	for id, hero in pairs(HeroUnit.heroes) do
+		if not seen[id] then
+			HeroUnit_Unregister(id, hero)
+		end
+	end
+end
+
+function HeroUnit_OnInit()
+	Rule_AddInterval(HeroUnit_Scan, HERO_CONFIG.scan_interval)
+	Rule_AddGlobalEvent(HeroUnit_OnEntityKilled, GE_EntityKilled)
+	Rule_AddGlobalEvent(HeroUnit_OnAbilityExecuted, GE_AbilityExecuted)
+end
+
+-- COH3 的模块系统会自动调用 HeroUnit_OnInit；没有 Core 时退回老式初始化
+if Core_RegisterModule ~= nil then
+	Core_RegisterModule("HeroUnit")
+else
+	Scar_AddInit(HeroUnit_OnInit)
+end
