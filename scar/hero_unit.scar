@@ -3,7 +3,7 @@
 
 	功能：
 	  1. 无限升星：原版老兵满级后，继续靠击杀累计“英雄经验”，每升一星叠加伤害 / 射速 / 减伤加成。
-	  2. 武器切换：点击“切换武器”能力，在 突击武器(hardpoint_assault) 与 火箭筒(hardpoint_rocket) 之间切换。
+	  2. 武器切换：点击“切换武器”能力，按 HERO_CONFIG.weapons 的顺序轮换武器（默认 突击武器 <-> 火箭筒）。
 	  3. 脱战回血：一段时间没有受伤 / 开火后，每秒按百分比回血，星级越高回得越快。
 	  4. 阵亡保留星级（可选）：英雄阵亡后重新生产，星级继承。
 
@@ -18,9 +18,15 @@ HERO_CONFIG = {
 	-- 蓝图名（在 Essence Editor 里的名字）
 	squad_blueprint   = "hero_sbp",                 -- 英雄小队蓝图
 	switch_ability    = "hero_weapon_switch_abp",   -- “切换武器”能力蓝图
-	hardpoint_assault = "hardpoint_01",             -- 突击武器所在 hardpoint
-	hardpoint_rocket  = "hardpoint_02",             -- 火箭筒所在 hardpoint
-	start_weapon      = "assault",                  -- 出生时的武器："assault" 或 "rocket"
+
+	-- 武器列表：每项对应实体上的一个 hardpoint，具体装什么枪在属性里自己选
+	-- （冲锋枪、霰弹枪都行）。点“切换武器”按这个顺序轮换，想三把轮换就再加一行。
+	weapons = {
+		{ name = "assault", hardpoint = "hardpoint_01" },  -- 突击武器：冲锋枪 / 霰弹枪
+		{ name = "rocket",  hardpoint = "hardpoint_02" },  -- 火箭筒
+		-- { name = "shotgun", hardpoint = "hardpoint_03" },
+	},
+	start_weapon = 1,                               -- 出生时用第几把（上面列表的序号）
 
 	-- 升星
 	vanilla_max_rank  = 3,      -- 原版老兵满级（到这级后才开始累计英雄经验）
@@ -33,7 +39,7 @@ HERO_CONFIG = {
 	damage_per_star          = 0.08,  -- 伤害 +8% / 星
 	fire_rate_per_star       = 0.04,  -- 射速 +4% / 星（冷却缩短）
 	damage_reduction_per_star = 0.04, -- 受到伤害 -4% / 星
-	min_received_damage      = 0.35,  -- 受到伤害倍率下限（最多减伤 65%）
+	min_received_damage      = 0.10,  -- 受到伤害倍率下限（最多减伤 90%，约第 23 星封顶）
 
 	-- 脱战回血
 	regen_delay          = 8,      -- 脱战多少秒后开始回血
@@ -91,7 +97,7 @@ function HeroUnit_Register(squad)
 		appliedStars = 0,
 		lastHealth   = Squad_GetHealth(squad),
 		lastCombat   = World_GetGameTime(),
-		weaponMode   = HERO_CONFIG.start_weapon,
+		weaponIndex  = HERO_CONFIG.start_weapon,
 	}
 	HeroUnit.heroes[id] = hero
 
@@ -101,7 +107,7 @@ function HeroUnit_Register(squad)
 		hero.xp = saved.xp
 	end
 
-	HeroUnit_SetWeaponMode(hero, hero.weaponMode)
+	HeroUnit_SetWeapon(hero, hero.weaponIndex)
 	return hero
 end
 
@@ -139,9 +145,9 @@ function HeroUnit_ApplyStar(hero, n)
 	end
 	local receivedRatio = received(n) / received(n - 1)
 
-	for _, hp in ipairs({ c.hardpoint_assault, c.hardpoint_rocket }) do
-		_HeroUnit_Call("Modify_WeaponDamage", hero.sg, hp, damage)
-		_HeroUnit_Call("Modify_WeaponCooldown", hero.sg, hp, cooldown)
+	for _, weapon in ipairs(c.weapons) do
+		_HeroUnit_Call("Modify_WeaponDamage", hero.sg, weapon.hardpoint, damage)
+		_HeroUnit_Call("Modify_WeaponCooldown", hero.sg, weapon.hardpoint, cooldown)
 	end
 	if receivedRatio < 1 then
 		_HeroUnit_Call("Modify_ReceivedDamage", hero.sg, receivedRatio)
@@ -184,11 +190,12 @@ end
 -- 武器切换
 ---------------------------------------------------------------------------
 
-function HeroUnit_SetWeaponMode(hero, mode)
-	local useRocket = (mode == "rocket")
-	_HeroUnit_Call("Modify_WeaponEnabled", hero.sg, HERO_CONFIG.hardpoint_assault, not useRocket)
-	_HeroUnit_Call("Modify_WeaponEnabled", hero.sg, HERO_CONFIG.hardpoint_rocket, useRocket)
-	hero.weaponMode = mode
+-- 只启用第 index 把武器，其余全部关闭
+function HeroUnit_SetWeapon(hero, index)
+	for i, weapon in ipairs(HERO_CONFIG.weapons) do
+		_HeroUnit_Call("Modify_WeaponEnabled", hero.sg, weapon.hardpoint, i == index)
+	end
+	hero.weaponIndex = index
 end
 
 function HeroUnit_OnAbilityExecuted(context)
@@ -209,11 +216,7 @@ function HeroUnit_OnAbilityExecuted(context)
 	if hero == nil then
 		return
 	end
-	if hero.weaponMode == "rocket" then
-		HeroUnit_SetWeaponMode(hero, "assault")
-	else
-		HeroUnit_SetWeaponMode(hero, "rocket")
-	end
+	HeroUnit_SetWeapon(hero, hero.weaponIndex % #HERO_CONFIG.weapons + 1)
 end
 
 ---------------------------------------------------------------------------
